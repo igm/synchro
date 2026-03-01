@@ -34,19 +34,21 @@
 
 ## Build
 
-Requires macOS 14+ and Xcode 16+.
+Requires macOS 14+, Xcode 16+, and [XcodeGen](https://github.com/yonaskolb/XcodeGen).
 
 ```bash
-brew install xcodegen  # if not installed
-xcodegen generate
-open Synchro.xcodeproj
+make build        # generate xcodeproj + release build
+make run          # debug build + launch app
+make install      # copy to /Applications
+make uninstall    # remove from /Applications
+make clean        # wipe build artifacts + xcodeproj
 ```
 
-Or build from the command line:
+Or open in Xcode:
 
 ```bash
-xcodegen generate
-xcodebuild -scheme Synchro build
+make generate
+open Synchro.xcodeproj
 ```
 
 ## CLI
