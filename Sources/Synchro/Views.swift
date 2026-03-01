@@ -148,6 +148,12 @@ struct ProgressSection: View {
                     .font(.subheadline)
                     .fontWeight(.medium)
                 Spacer()
+                if progress.filesProcessed > 0 {
+                    Text("\(progress.filesProcessed) file\(progress.filesProcessed == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
             }
 
             if let file = progress.currentFile {

@@ -78,6 +78,7 @@ enum SyncPhase: Equatable {
 struct SyncProgress {
     var phase: SyncPhase = .idle
     var currentFile: String?
+    var filesProcessed: Int = 0
     var bytesTransferred: Int64 = 0
     var totalBytes: Int64?
 }

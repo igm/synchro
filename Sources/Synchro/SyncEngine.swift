@@ -148,6 +148,7 @@ final class SyncEngine: ObservableObject {
 
                 result.duration = Date().timeIntervalSince(start)
                 progress.phase = .completed
+                progress.currentFile = nil
 
                 if configuration.dryRun {
                     appendLog("Dry run complete. No changes made.")
@@ -193,59 +194,124 @@ final class SyncEngine: ObservableObject {
         args.append(source.path(percentEncoded: false) + "/")
         args.append(target.path(percentEncoded: false) + "/")
 
-        return try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/rsync")
-            process.arguments = args
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/rsync")
+        process.arguments = args
 
+        // Use a PTY for stdout so rsync line-buffers its output in real time.
+        // When stdout is a pipe, rsync's C stdio full-buffers and we only see
+        // output after rsync exits. A PTY looks like a terminal, forcing
+        // line-buffered writes. Falls back to a plain Pipe if PTY creation fails.
+        let pty = makePTY()
+        let outReader: FileHandle
+        let outWriter: FileHandle?
+        if let pty {
+            process.standardOutput = pty.secondary
+            outReader = pty.primary
+            outWriter = pty.secondary
+        } else {
             let pipe = Pipe()
-            let errorPipe = Pipe()
             process.standardOutput = pipe
-            process.standardError = errorPipe
+            outReader = pipe.fileHandleForReading
+            outWriter = nil
+        }
 
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: error)
-                return
-            }
+        let errPipe = Pipe()
+        process.standardError = errPipe
 
-            // Read output in background
-            Task.detached { [weak self] in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
+        try process.run()
 
-                let output = String(data: data, encoding: .utf8) ?? ""
-                let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
+        // Close our copy of the PTY secondary — the process inherited it
+        outWriter?.closeFile()
 
-                await MainActor.run {
-                    // Stream individual file lines to log
-                    for line in output.components(separatedBy: "\n") {
-                        let trimmed = line.trimmingCharacters(in: .whitespaces)
-                        if !trimmed.isEmpty {
-                            self?.appendLog(trimmed)
-                        }
-                    }
-                    if !errorOutput.isEmpty {
-                        for line in errorOutput.components(separatedBy: "\n") {
-                            let trimmed = line.trimmingCharacters(in: .whitespaces)
-                            // Filter out common macOS system errors that are harmless
-                            if !trimmed.isEmpty && !(self?.shouldFilterError(trimmed) ?? false) {
-                                self?.appendLog("⚠ \(trimmed)")
-                            }
-                        }
+        // Read stderr concurrently to avoid pipe buffer deadlock
+        let stderrTask = Task.detached { () -> String in
+            let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+            return String(data: data, encoding: .utf8) ?? ""
+        }
+
+        // Stream stdout line by line for live progress
+        var output = ""
+        try await withTaskCancellationHandler {
+            for try await line in outReader.bytes.lines {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    output += line + "\n"
+                    appendLog(trimmed)
+                    if let fileName = parseItemizeLine(trimmed) {
+                        progress.currentFile = fileName
+                        progress.filesProcessed += 1
                     }
                 }
+            }
+        } onCancel: {
+            process.terminate()
+        }
 
-                if process.terminationStatus != 0 && process.terminationStatus != 23 {
-                    // 23 = partial transfer (some files couldn't be transferred)
-                    continuation.resume(throwing: SyncError.rsyncFailed(Int(process.terminationStatus), errorOutput))
-                } else {
-                    continuation.resume(returning: output)
+        process.waitUntilExit()
+
+        let errorOutput = await stderrTask.value
+        if !errorOutput.isEmpty {
+            for line in errorOutput.components(separatedBy: "\n") {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty && !shouldFilterError(trimmed) {
+                    appendLog("⚠ \(trimmed)")
                 }
             }
         }
+
+        if process.terminationStatus != 0 && process.terminationStatus != 23 {
+            // 23 = partial transfer (some files couldn't be transferred)
+            throw SyncError.rsyncFailed(Int(process.terminationStatus), errorOutput)
+        }
+
+        return output
+    }
+
+    /// Create a pseudo-terminal pair. rsync line-buffers stdout when it detects
+    /// a terminal, so a PTY ensures output streams in real time.
+    private nonisolated func makePTY() -> (primary: FileHandle, secondary: FileHandle)? {
+        let fd = posix_openpt(O_RDWR | O_NOCTTY)
+        guard fd >= 0 else { return nil }
+        guard grantpt(fd) == 0, unlockpt(fd) == 0, let name = ptsname(fd) else {
+            close(fd)
+            return nil
+        }
+        let sec = open(name, O_RDWR)
+        guard sec >= 0 else { close(fd); return nil }
+
+        // Disable OPOST so the terminal driver doesn't convert \n → \r\n
+        var tio = termios()
+        if tcgetattr(sec, &tio) == 0 {
+            tio.c_oflag &= ~tcflag_t(OPOST)
+            tcsetattr(sec, TCSANOW, &tio)
+        }
+
+        return (
+            FileHandle(fileDescriptor: fd, closeOnDealloc: true),
+            FileHandle(fileDescriptor: sec, closeOnDealloc: true)
+        )
+    }
+
+    /// Parse rsync --itemize-changes line to extract the filename.
+    /// Format: YXcstpoguax filename (11-char prefix + space + path)
+    private func parseItemizeLine(_ line: String) -> String? {
+        // Standard itemize: ">f..t...... path/to/file"
+        if line.count > 12 {
+            let first = line[line.startIndex]
+            if "<>ch.".contains(first) {
+                let idx = line.index(line.startIndex, offsetBy: 12)
+                let fileName = String(line[idx...])
+                return fileName.isEmpty ? nil : fileName
+            }
+        }
+        // Delete format: "*deleting   path/to/file"
+        if line.hasPrefix("*deleting") {
+            let rest = String(line.dropFirst("*deleting".count))
+                .trimmingCharacters(in: .whitespaces)
+            return rest.isEmpty ? nil : rest
+        }
+        return nil
     }
 
     // MARK: - Parsing
