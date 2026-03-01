@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Sources/Synchro/Assets.xcassets/AppIcon.appiconset/icon_256.png" width="128" height="128" alt="Synchro icon">
+  <img src=".github/icon.png" width="128" height="128" alt="Synchro icon">
 </p>
 
 <h1 align="center">Synchro</h1>
